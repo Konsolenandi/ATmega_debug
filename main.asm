@@ -7,6 +7,10 @@
 .equ	TRUE			=	1
 .equ	FALSE			=	0
 .equ	TIM2_DIVIDER	=	0b011		; Has to be 111 (=/1024), 110 (=/256), 101(=/128), 100(=/64), 011(=/32), 010(=/8), 001 (=/1)
+.equ	RXBUF_SIZE		=	16			; Size of UART Receive buffer; Mustn't exceed 256
+.equ	TXBUF_SIZE		=	16			; Size of UART Transmit buffer; Mustn't exceed 256
+.equ	LINE_BEGIN		=	'<'
+
 .def	TIMSYSL			=	r5			; Low byte. Don't use system timer registers anywhere else
 .def	TIMSYSH			=	r6			; High byte
 
@@ -39,8 +43,8 @@
 ;	rjmp   USART_RXC      ; USART RX Complete Handler
 ;.org 0x000c         
 ;	rjmp   USART_UDRE     ; UDR Empty Handler
-;.org 0x000d         
-;	rjmp   USART_TXC      ; USART TX Complete Handler
+.org 0x000d         
+	rjmp   USART_TXC      ; USART TX Complete Handler
 ;.org 0x000e         
 ;	rjmp   ADC_Ready	  ; ADC Conversion Complete Handler
 ;.org 0x000f         
@@ -54,6 +58,8 @@
 .org 0x0013
 
 ; Interrupts must push used registers no matter if they are caller- or callee-saved
+
+; SYSTEM TIMER
 TIM2_COMP:	; Update System Timer = TIMSYSH|TIMSYSL
 	push	r16
 	clr		r16
@@ -75,6 +81,47 @@ ms250_passed:
 	pop		XL
 	pop		XH	
 rjmp TIM2_COMP_end
+
+; UART Transmission
+USART_TXC:
+	push	r2
+	push	r16
+	push	r17
+	push	YH
+	push	YL
+
+	ldi		YH,		HIGH(UART_TX_P)
+	ldi		YL,		LOW(UART_TX_P)
+	ld		r16,	Y+		; Load current index into register (UART_TX_P)
+	ld		r17,	Y		; Load data length into register (UART_TX_LEN)
+
+	clr		r2
+	ldi		YH,		HIGH(UART_TX_BUF)
+	ldi		YL,		LOW(UART_TX_BUF)
+	add		YL,		r16
+	adc		YH,		r2		; Get address of current byte to send
+	ld		r2,		Y
+
+	out		UDR,	r2		; Begin transmission
+
+	inc		r16
+	cp		r16,	r17
+	brlo	USART_tx_notdone	; End of data reached
+	cbi		UCSRB,	TXCIE	; Disable Interrupt
+	rjmp	USART_TXC_end
+USART_tx_notdone:	
+	ldi		YH,		HIGH(UART_TX_P)
+	ldi		YL,		LOW(UART_TX_P)
+	st		Y,		r16		; Store next index
+
+USART_TXC_end:
+	pop		YL
+	pop		YH
+	pop		r17
+	pop		r16
+	pop		r2
+reti
+
 
 ; End of Interrupt routines
 ; ---------------------------------------------
@@ -110,6 +157,7 @@ init:
 ; Enable interrupt for normal operation
 	sei
 
+	clr		r17
 ; Replace with your application code
 loop:
 	ldi		XH,		HIGH(ispassed_250ms)
@@ -122,12 +170,43 @@ schedule_250ms:
 	ldi		r16,	FALSE
 	st		X,		r16
 	; Insert user code here
-	ldi		r16,	'T'
-	rcall	USART_Transmit	
+
 	; End of user code
+	inc		r17
+	cpi		r17,	4
+	brsh	schedule_1s
+rjmp loop
+schedule_1s:
+	clr		r17
+	rcall	TESTBUF_Init
+
+	ldi		r16,	6
+	mov		r12,	r16
+	ldi		r16,	HIGH(TESTBUF)	
+	mov		r11,	r16	
+	ldi		r16,	LOW(TESTBUF)
+	mov		r10,	r16
+	rcall USART_Transmit
 rjmp loop
 
-softBp:
+Debug_softBp:
+
+TESTBUF_Init:
+	ldi		XH,		HIGH(TESTBUF)
+	ldi		XL,		LOW(TESTBUF)
+	ldi		r16,	'A'
+	st		X+,		r16
+	inc		r16
+	st		X+,		r16
+	inc		r16
+	st		X+,		r16
+	inc		r16
+	st		X+,		r16
+	inc		r16	
+	st		X+,		r16
+	inc		r16
+	st		X+,		r16
+ret
 
 ; Inits USART with Baudrate 115200 @ 8MHz
 USART_Init:
@@ -144,9 +223,10 @@ USART_Init:
 	out		UCSRC,	r21
 ret
 
-; Transmit data via UART
-;	input:	r10
-USART_Transmit:
+; Transmit uint8 via UART
+;	input:	r10 -> Data to transmit
+;	stack:	0 Bytes
+USART_TransmitU8:
 	; Wait for empty transmit buffer
 	sbis	UCSRA,	UDRE
 	rjmp	USART_Transmit
@@ -154,3 +234,35 @@ USART_Transmit:
 	out		UDR,	r10
 ret
 
+; Transmit multiple bytes via UART (uses interrupt)
+;	input:	r10 (LSB), r11 (MSB)	-> data pointer
+;	input:	r12						-> Length of data
+;	stack:	2 Bytes
+USART_Transmit:
+	push	XH
+	push	XL
+	ldi		XH,		HIGH(UART_TX_BUF)
+	ldi		XL,		LOW(UART_TX_BUF)
+	mov		YH,		r11
+	mov		YL,		r10
+	clr		r2
+	USART_Transmit_for01:
+	ld		r3,		Y+
+	st		X+,		r3	; ToDo: Check for memory violation
+	inc		r2
+	cp		r2,		r12
+	brlo	USART_Transmit_for01			
+	USART_Transmit_for01_end:
+	; Setup for asynchronous transmission
+	ldi		YH,		HIGH(UART_TX_P)
+	ldi		YL,		LOW(UART_TX_P)
+	clr		r2
+	st		Y+,		r2	; Set index of current transmission to 0	(UART_TX_P)
+	st		Y,		r12 ; Set length of current transmission		(UART_TX_LEN)
+	sbi		UCSRA,	TXC		; Clear previous interrupt flag
+	sbi		UCSRB,	TXCIE	; Enable interrupt
+	ldi		r21,	LINE_BEGIN
+	out		UDR,	r21
+	pop		XL
+	pop		XH
+ret
